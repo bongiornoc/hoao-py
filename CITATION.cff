@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use hoao in research, please cite the accompanying manuscript."
+type: software
+title: "hoao: correlation and cokurtosis estimation"
+version: 0.1.0
+license: BSD-3-Clause
+repository-code: "https://github.com/bongiornoc/hoao-py"
+authors:
+  - family-names: Bongiorno
+    given-names: Christian
+  - family-names: Ruelloux
+    given-names: Paul
+preferred-citation:
+  type: unpublished
+  title: "Nonlinear Shrinkage for Higher Moments Estimation in Large Portfolios"
+  authors:
+    - family-names: Ruelloux
+      given-names: Paul
+    - family-names: Bongiorno
+      given-names: Christian
+    - family-names: Challet
+      given-names: Damien
+  year: 2026
+  notes: "Manuscript prepared for submission to Annals of Operations Research."

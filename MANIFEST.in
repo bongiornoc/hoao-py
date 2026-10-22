@@ -1,0 +1,7 @@
+include CITATION.cff
+recursive-include docs *.rst *.py
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include benchmarks *.py *.md *.json
+prune docs/_build
+global-exclude __pycache__ *.py[cod]

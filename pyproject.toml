@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hoao"
+version = "0.1.0"
+description = "Cross-validated and historical oracle estimators for correlation and cokurtosis"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [
+  {name = "Christian Bongiorno", email = "christian.bongiorno@centralesupelec.fr"},
+  {name = "Paul Ruelloux", email = "paul.ruelloux@centralesupelec.fr"},
+]
+keywords = ["covariance", "correlation", "cokurtosis", "portfolio", "shrinkage", "average-oracle"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Typing :: Typed",
+]
+dependencies = ["numpy>=2.0", "scipy>=1.14", "threadpoolctl>=3.5"]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.2"]
+cuda12 = ["cupy-cuda12x>=13.3"]
+cuda13 = ["cupy-cuda13x>=14.0"]
+dev = [
+  "pytest>=8", "pandas>=2.2", "pyright>=1.1.400", "numpydoc>=1.8",
+  "sphinx>=8", "build>=1.2", "twine>=6", "ruff>=0.11",
+  "pandas-stubs>=2.2", "scipy-stubs>=1.14",
+]
+
+[project.urls]
+Homepage = "https://github.com/bongiornoc/hoao-py"
+Repository = "https://github.com/bongiornoc/hoao-py"
+Issues = "https://github.com/bongiornoc/hoao-py/issues"
+Documentation = "https://github.com/bongiornoc/hoao-py/tree/main/docs"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hoao = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.pyright]
+include = ["src/hoao"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
