@@ -167,6 +167,20 @@ def test_exact_nanosecond_boundaries_and_timezone_conversion_are_retained():
     assert str(_date(minimum)) == minimum
     assert str(_date(maximum)) == maximum
     assert str(_date("2262-04-12T00:47:16.854775807+01:00")) == maximum
+    assert str(_date("1677-09-20T23:12:43.145224193-01:00")) == minimum
     for stamp in ("1677-09-21T00:12:43.145224192", "2262-04-11T23:47:16.854775808"):
         with pytest.raises(ValueError, match="Invalid date"):
             _date(stamp)
+
+
+@pytest.mark.parametrize("stamp", [
+    "2262-04-12T00:47:16.854775808+01:00",
+    "1677-09-20T23:12:43.145224192-01:00",
+    "2262-04-11T23:47:16.854775807-00:01",
+    "1677-09-21T00:12:43.145224193+00:01",
+])
+def test_timezone_offsets_are_checked_against_utc_nanosecond_bounds(stamp):
+    from hoao.panel import _date
+
+    with pytest.raises(ValueError, match="Invalid date"):
+        _date(stamp)

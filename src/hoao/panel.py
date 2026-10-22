@@ -29,7 +29,6 @@ def _date(value: Any) -> np.datetime64:
     if isinstance(value, (int, float, np.integer, np.floating, bool)):
         raise ValueError("A dated panel needs a date-like cutoff, not an integer")
     try:
-        expected_microseconds = None
         if hasattr(value, "to_datetime64"):
             if value.tzinfo is not None:
                 value = value.tz_convert("UTC").tz_localize(None)
@@ -37,20 +36,25 @@ def _date(value: Any) -> np.datetime64:
         elif isinstance(value, np.datetime64):
             stamp = value
         elif isinstance(value, str):
-            # NumPy can silently wrap an out-of-range string when its unit is
-            # already ns. Parse its civil time independently before converting.
+            # Perform timezone conversion before constructing any NumPy ns
+            # timestamp: a valid UTC instant can have an out-of-range local
+            # clock reading. Python integers also preserve the submicrosecond
+            # fraction discarded by datetime.fromisoformat.
             parsed = datetime.fromisoformat(value)
             utc = (parsed.astimezone(timezone.utc).replace(tzinfo=None)
                    if parsed.tzinfo is not None else parsed)
-            expected_microseconds = np.datetime64(utc, "us")
-            offset = re.search(r"(Z|[+-]\d{2}:?\d{2})$", value)
-            if offset:
-                delta = parsed.utcoffset()
-                stamp = np.datetime64(value[:offset.start()], "ns")
-                if delta is not None:
-                    stamp -= np.timedelta64(int(delta.total_seconds() * 1_000_000), "us")
-            else:
-                stamp = np.datetime64(value, "ns")
+            elapsed = utc - datetime(1970, 1, 1)
+            nanoseconds = ((elapsed.days * 86400 + elapsed.seconds) * 1_000_000
+                           + elapsed.microseconds) * 1000
+            fraction = re.search(r"[T ]\d{2}(?::?\d{2})?(?::?\d{2})?[.,](\d+)", value)
+            if fraction:
+                digits = fraction.group(1)
+                if any(digit != "0" for digit in digits[9:]):
+                    raise ValueError("Date cannot be represented at nanosecond precision")
+                nanoseconds += int(digits.ljust(9, "0")[6:9])
+            if not -2**63 < nanoseconds < 2**63:
+                raise ValueError("Date lies outside the datetime64[ns] range")
+            return np.datetime64(nanoseconds, "ns")
         else:
             if isinstance(value, datetime) and value.tzinfo is not None:
                 value = value.astimezone(timezone.utc).replace(tzinfo=None)
@@ -81,11 +85,7 @@ def _date(value: Any) -> np.datetime64:
         # ns boundary, including its ns->us flooring implementation.
         if not -2**63 < nanoseconds < 2**63:
             raise ValueError("Date lies outside the datetime64[ns] range")
-        normalized = np.datetime64(nanoseconds, "ns")
-        if (expected_microseconds is not None
-                and nanoseconds // 1000 != int(expected_microseconds.astype(np.int64))):
-            raise ValueError("Date lies outside the datetime64[ns] range")
-        return normalized
+        return np.datetime64(nanoseconds, "ns")
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"Invalid date: {value!r}") from exc
 
