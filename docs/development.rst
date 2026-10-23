@@ -1,10 +1,11 @@
 Development and release
 =======================
 
-Local checks
-------------
+Working on the package
+----------------------
 
-Use a fresh environment from the repository root:
+From a repository checkout, install the development extra in a virtual
+environment. It includes the test, type-checking and documentation tools:
 
 .. code-block:: console
 
@@ -12,37 +13,41 @@ Use a fresh environment from the repository root:
    . .venv/bin/activate
    python -m pip install -e '.[dev]'
    python -m pytest
+   python -m pytest --doctest-modules src/hoao
    python -m pyright --pythonpath "$(command -v python)"
    python docs/check_docstrings.py
    python -m ruff check src tests examples docs
    python -m sphinx -W --keep-going -b html docs docs/_build/html
 
-The example tests execute complete workflows using deterministic synthetic
-data. Numerical tests should compare compact calculations against independent
-dense formulas at small dimensions, verify derivatives, check label alignment,
-and reject temporal leakage. CPU workflows must work without pandas or CuPy.
-An optional backend needs explicit tests and a clear skip when its runtime is
-unavailable; an untested GPU must not be described as a measured speedup.
+The suite compares compact moment calculations with independent dense
+formulas at small dimensions, checks derivatives and label alignment, and
+verifies calibration chronology and reproducibility. It also executes the
+README and example scripts on synthetic data. The separate doctest command
+runs examples embedded in public docstrings.
 
-The release includes inline type annotations and ``py.typed`` for editors.
-NumPy-style docstrings are the API documentation source. Every public
-operation should explain shapes, units, normalization, exceptions, and a
-small executable example. Add design explanations in the guide when a
-choice changes the scientific estimator rather than only its implementation.
+Keep CPU workflows usable without pandas or CuPy. Tests of optional
+dependencies should state why they are skipped when the dependency or its
+runtime is unavailable. GPU timing requires a working device and should
+include transfers and synchronization.
 
-Build an artifact
------------------
+Public docstrings supply the API reference and editor help. Describe array
+shapes, units, normalization, exceptions and a small executable example in
+NumPy format; keep inline type annotations consistent with that contract.
+Explain estimator conventions in the user guide and mathematical notes,
+where readers can follow their consequences across methods.
+
+Building distributions
+----------------------
 
 .. code-block:: console
 
    python -m build
    python -m twine check dist/*
 
-Inspect both the wheel and source distribution before release. Confirm that
-``hoao/py.typed`` and the license are in the wheel, and that no return datasets,
-calibration checkpoints, credentials, or research output directories have
-entered either artifact. Check the installed wheel in a fresh environment,
-not only the editable source tree:
+The wheel must include ``hoao/py.typed`` and the license. Inspect both
+archives to ensure they contain only package code, documentation, tests and
+synthetic examples, with no research datasets or calibration state. Verify
+the built wheel in a fresh environment:
 
 .. code-block:: console
 
@@ -63,12 +68,11 @@ GitHub Actions tests supported Python versions, performs platform smoke
 checks, validates types and documentation, and uploads build artifacts for
 inspection. It contains no PyPI publication step and needs no PyPI token.
 
-Maintainer publication
-----------------------
+Publishing a release
+--------------------
 
-PyPI publication is a separate maintainer action. Before uploading, verify
-that the distribution name is available to the publisher, review the
-repository visibility and attribution, and update the version in
+PyPI publication is performed by a maintainer. Confirm ownership of the
+distribution name, then update the version in
 ``pyproject.toml``, ``src/hoao/__init__.py``, ``docs/conf.py``, and
 ``CITATION.cff`` together. A version already uploaded to PyPI cannot be
 replaced with a different artifact.
@@ -82,6 +86,6 @@ managed outside the repository:
    # After reviewing the test release:
    python -m twine upload dist/*
 
-The second command publishes publicly. The package does not execute either
-command automatically. Repository tags and a GitHub release should refer
-to the exact source used to build the uploaded artifacts.
+The second command publishes the distribution on PyPI. Tag the exact source
+commit used to build the artifacts and attach those same artifacts to the
+corresponding GitHub release.

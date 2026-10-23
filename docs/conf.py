@@ -1,6 +1,6 @@
 """Sphinx configuration for the public API and numerical conventions."""
 
-project = "hoao"
+project = "HOAO"
 author = "Christian Bongiorno and Paul Ruelloux"
 copyright = "2026, Christian Bongiorno and Paul Ruelloux"
 release = "0.1.0"

@@ -64,11 +64,12 @@ are measured separately.
 
 Peak resident memory includes the Python interpreter, imported dependencies,
 the synthetic panel, and all measured operations in that process. It is not
-the incremental memory of a single fit. The filtered fourth-moment object
-(basis, core, and marginal scales) occupied 40,400 bytes at 50 assets,
-160,800 bytes at 100 assets, and 641,600 bytes at 200 assets. A dense
-float64 fourth tensor at 200 assets would require 12.8 billion bytes for the
-tensor alone.
+the incremental memory of a single fit. The filtered fourth moment's basis,
+core and marginal-scale arrays occupied 40,400 bytes at 50 assets,
+160,800 bytes at 100 assets, and 641,600 bytes at 200 assets. These array
+counts exclude the cached volatility-scaled basis used for portfolio
+calculations; it occupies another square matrix. A dense float64 fourth
+tensor at 200 assets would require 12.8 billion bytes for the tensor alone.
 
 Reproduce the measurements on a Linux or macOS host from the repository:
 

@@ -1,10 +1,11 @@
 Mathematical and numerical conventions
 ======================================
 
-The fitted object maps a current return window to correlation, covariance,
-and a compact fourth-order model. Calibration supplies the coefficients;
-the current window supplies marginal scales and the bases in which those
-coefficients are interpreted.
+A fitted model combines correlation, covariance and fourth central
+co-moments for a current return window. CV obtains dependence coefficients
+from random splits of that window; historical AO and HOAO use coefficients
+calibrated on earlier window pairs. In both cases, the current window
+supplies marginal scales and the bases in which the coefficients are applied.
 
 Observations and standardization
 --------------------------------
@@ -12,8 +13,8 @@ Observations and standardization
 Let :math:`\mathbf X\in\mathbb R^{\Delta t\times n}` contain
 :math:`\Delta t` observations of :math:`n` assets. Rows index time and
 columns index assets. The current sample mean is
-:math:`\hat{\boldsymbol\mu}\in\mathbb R^n`; marginal population standard
-deviations form
+:math:`\hat{\boldsymbol\mu}\in\mathbb R^n`; marginal sample standard
+deviations with population normalization (``ddof=0``) form
 :math:`\widehat{\mathbf D}=\operatorname{diag}(\hat{\boldsymbol\sigma})
 \in\mathbb R^{n\times n}`. Standardized observations are
 
@@ -28,8 +29,9 @@ then operates on the dependence structure, rather than carrying historical
 volatility levels into the current estimate.
 
 CV standardizes the full fitting window before splitting and re-centers each
-training and testing subsample. HOAO standardizes the training and testing
-windows independently. Changing this convention changes the estimator.
+training and testing subsample. Historical AO and HOAO standardize the
+training and testing windows independently. Changing this convention changes
+the estimator.
 
 Correlation and covariance
 --------------------------
@@ -155,8 +157,10 @@ The fourth moment's gradient in rotated coordinates is
 
 Multiplication by :math:`\widehat{\mathbf D}\mathbf U_4` maps this to
 weight coordinates. Hessian-vector products use the same compact core.
-The package exposes convergence diagnostics; a solver return is not a claim
-about future returns.
+The returned diagnostics include the budget-constrained gradient residual.
+Acceptance requires a budget error no larger than ``1e-10`` and a residual
+no larger than ``max(1e-6, 10 * tol)``. An unsuccessful solve raises
+``OptimizationError`` with the diagnostic candidate attached.
 
 Limitations and numerical reproducibility
 -----------------------------------------

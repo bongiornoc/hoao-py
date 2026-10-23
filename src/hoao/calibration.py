@@ -1,4 +1,10 @@
-"""Historical AO/HOAO calibration with reproducible sampling and safe state."""
+"""Historical calibration of AO correlation and HOAO cokurtosis.
+
+Calibration averages coefficients measured in later return windows
+along bases estimated from earlier windows. The resulting coefficients
+can be applied to a current window, updated with more historical pairs,
+and saved together with their sampling and chronology information.
+"""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -41,60 +47,84 @@ def _readonly(array: NDArray[Any]) -> NDArray[Any]:
 
 
 class Calibration:
-    """Reusable historical AO and HOAO cores, averaged by spectral rank.
+    """Historical AO and HOAO coefficients, averaged by spectral rank.
 
-    Create instances with :func:`calibrate` or :meth:`load`. Calibration is
-    specific to its asset count and training-window length, but not to asset
-    identities. Each historical pair contributes equally, including after
-    updates and save/load cycles. All arithmetic uses float64.
+    Create a calibration with :func:`calibrate`, or restore one with
+    :meth:`load`. Its fitting methods combine the historical coefficients
+    with bases and marginal volatilities estimated from a current return
+    window. The calibration is specific to its asset count and window
+    lengths, but can be applied to different asset identities.
 
     Attributes
     ----------
-    n_assets, train_size, test_size, gap : int
-        Sampling dimensions. ``gap`` counts sessions omitted between the
-        training and target windows; the default of one skips execution day.
+    n_assets : int
+        Number of assets sampled in each pair and required when fitting.
+    train_size, test_size : int
+        Observations in each training and subsequent target window.
+        Fitting a current window requires exactly `train_size` rows.
+    gap : int
+        Observations skipped between training and target windows.
     n_pairs : int
-        Number of accumulated historical pairs, also the next sampling ID.
-    correlation_core : numpy.ndarray of shape (n_assets,)
-        Mean target variances along the training correlation eigenvectors.
-    cokurtosis_core : numpy.ndarray of shape (n_assets, n_assets)
-        Mean cross-moments of squared target coordinates in the training
-        fourth-moment basis. This is an even core, not a dense fourth tensor.
+        Total number of accumulated pairs. Each contributes equal weight
+        to both cores, including after updates and save/load cycles.
+    correlation_core : ndarray of float64, shape (n_assets,)
+        Read-only mean target variances along training correlation
+        eigenvectors, indexed by decreasing training eigenvalue rank.
+    cokurtosis_core : ndarray of float64, shape (n_assets, n_assets)
+        Read-only mean products of squared target coordinates in the
+        training fourth-order basis. Both indices follow decreasing
+        singular-value rank in that basis.
     before : int or numpy.datetime64
-        Exclusive cutoff supplied at the latest calibration/update. Applying
-        the core at an earlier signal date is rejected conservatively.
+        Exclusive target cutoff of the latest calibration or update.
+        An application date must be at least this cutoff.
     latest_target : int or numpy.datetime64
-        Latest target observation actually used; always strictly before
-        ``before`` and the signal date used for fitting.
+        Latest target observation actually sampled. It is strictly
+        earlier than `before` and any permitted application date.
+    missing : {'zero', 'raise'}
+        Policy for missing target returns, fixed at initial calibration.
     filled_count : int
-        Count of NaN target observations explicitly replaced by zero.
-    filled_locations : numpy.ndarray of int64, shape (filled_count, 3)
-        Columns are sampling pair ID, absolute panel row, and panel column.
-        Rows preserve pair order. Positions refer to the panel supplied for
-        that pair; they do not claim that a missing return was an economic
-        exit. Updating with a different panel requires retaining that panel's
-        axes if these locations will be audited later.
+        Number of sampled target NaNs replaced with zero. An observation
+        sampled in several pairs contributes once per occurrence.
+    filled_locations : ndarray of int64, shape (filled_count, 3)
+        Read-only records of ``(pair_id, panel_row, panel_column)``, in
+        pair order. All positions are zero-based and refer to the panel
+        used for that pair. Retain the corresponding panel axes if
+        later updates use different rows or columns.
+
+    See Also
+    --------
+    calibrate : Construct a calibration from a return history.
+    ReturnsPanel : Store history and availability known on each date.
 
     Notes
     -----
-    A saved core contains arrays and JSON metadata, never executable pickle.
-    The random seed and next pair ID are saved. For the same panel, cutoff,
-    and optional start bound, splitting a calibration into several updates
-    produces exactly the same ordered sums as one uninterrupted run, even
-    when the CPU worker count changes. Changing the sampling bounds changes
-    the sampling distribution for the new pair IDs.
+    Coefficients are dimensionless: training and target windows are
+    standardized independently before projection. Current marginal
+    volatilities are restored when fitting. Historical asset identities
+    and volatility levels are not carried into the fitted model.
+
+    Persistence retains coefficient sums, the pair count, random seed,
+    dimensions, cutoffs, missing-return records and basis convention in
+    an NPZ file with JSON metadata. For the same panel, sampling bounds
+    and numerical backend, splitting a run into updates preserves the
+    sampling sequence and accumulation order. Changing CPU worker count
+    does not change those results. Changing a bound changes the sampling
+    distribution for subsequent pairs.
 
     Examples
     --------
+    This positional history uses rows before 80 for calibration. The
+    current fitting window ends at row 99, after all calibration targets:
+
     >>> import numpy as np
     >>> from hoao import ReturnsPanel, calibrate
-    >>> returns = np.random.default_rng(2).normal(size=(120, 3)) * 0.01
-    >>> panel = ReturnsPanel(returns)
-    >>> core = calibrate(panel, n_assets=3, train_size=20, test_size=10,
-    ...                  n_pairs=4, before=90, random_state=7)
-    >>> fitted = core.fit(returns[80:100], as_of=99)
-    >>> fitted.correlation.shape
-    (3, 3)
+    >>> history = 0.01 * np.random.default_rng(2).normal(size=(100, 5))
+    >>> calibration = calibrate(ReturnsPanel(history), n_assets=3,
+    ...                         train_size=20, test_size=10, n_pairs=4,
+    ...                         before=80, random_state=7)
+    >>> model = calibration.fit(history[-20:, :3], as_of=99)
+    >>> model.covariance.shape, model.cokurtosis.core.shape
+    ((3, 3), (3, 3))
     """
 
     n_assets: int
@@ -126,26 +156,26 @@ class Calibration:
 
     @property
     def correlation_core(self) -> FloatArray:
-        """Read-only mean AO eigenvalues, ordered by decreasing sample rank."""
+        """Read-only AO coefficients indexed by decreasing training eigenvalue rank."""
         if self.n_pairs < 1:
             raise ValueError("Calibration is empty")
         return _readonly(self._sum2 / self.n_pairs)
 
     @property
     def cokurtosis_core(self) -> FloatArray:
-        """Read-only mean HOAO even-core matrix, without an n**4 allocation."""
+        """Read-only HOAO even core, shaped (n_assets, n_assets)."""
         if self.n_pairs < 1:
             raise ValueError("Calibration is empty")
         return _readonly(self._sum4 / self.n_pairs)
 
     @property
     def filled_locations(self) -> NDArray[np.int64]:
-        """Read-only (pair ID, panel row, panel column) zero-fill records."""
+        """Read-only zero-fill records: (pair_id, panel_row, panel_column)."""
         return _readonly(self._filled)
 
     @property
     def filled_count(self) -> int:
-        """Number of target NaNs replaced by the explicit zero-return policy."""
+        """Number of target NaNs replaced with zero across all sampled pairs."""
         return len(self._filled)
 
     def _fitting_data(self, returns: ReturnInput, as_of: Any) -> tuple[Any, ...]:
@@ -174,34 +204,71 @@ class Calibration:
 
     def fit(self, returns: ReturnInput, *, as_of: Cutoff | None = None,
             device: Device = "cpu") -> MomentModel:
-        """Fit both moments using the historical cores and current scales.
+        """Apply historical AO and HOAO coefficients to a current return window.
 
         Parameters
         ----------
-        returns : pandas.DataFrame or array_like, shape (train_size, n_assets)
-            Current finite return observations in chronological order. Their
-            asset identities may differ from the historical calibration's.
-            Each column must have positive variance. Sample moments use
-            ``ddof=0`` and are returned in the supplied return units.
+        returns : array_like or pandas.DataFrame, shape (train_size, n_assets)
+            Current finite returns, with exactly the dimensions used in
+            calibration and positive variance in every column. Asset
+            identities may differ from the historical panel. DataFrame
+            columns must be unique, non-missing asset labels, and its index
+            must be unique and increasing.
         as_of : date-like or int, optional
-            Signal date (or absolute row for a positional calibration).
-            Inferred from the final index entry for a dated DataFrame;
-            required for arrays. It must not precede any fitting observation
-            or the calibration cutoff. All historical targets must be earlier.
-        device : {"cpu", "cuda"}, default="cpu"
-            Compute backend for the bases. CUDA requires the optional GPU
-            dependency; returned public arrays are NumPy float64 arrays.
+            Application date, or absolute row position for a positional
+            calibration. Required for arrays. For a DataFrame, it defaults
+            to the final index entry, which must use the calibration's date
+            convention. It must be at least the calibration cutoff and no
+            earlier than the last fitting observation; all calibration
+            targets must be strictly earlier.
+        device : {'cpu', 'cuda'}, default='cpu'
+            Backend for the current bases. Experimental CUDA support requires
+            a compatible CuPy installation and a working NVIDIA driver.
+            Results use NumPy float64 arrays with either backend.
 
         Returns
         -------
         MomentModel
-            Sample mean, AO correlation/covariance, HOAO even cokurtosis, and
-            the raw equal-weight sample variance used for optimization.
+            Current sample mean, AO correlation and covariance, HOAO
+            cokurtosis, and raw equal-weight sample variance. Marginal scales
+            use ``ddof=0``; outputs retain the input units and frequency.
+
+        Raises
+        ------
+        TypeError
+            If returns do not have a real numeric dtype.
+        ValueError
+            If returns, dimensions, labels, dates or `device` are invalid.
+        ImportError
+            If CUDA is requested but CuPy is not installed.
+        RuntimeError
+            If the requested CUDA device cannot be initialized.
+
+        See Also
+        --------
+        fit_correlation : Apply only the second-order coefficients.
+        fit_cokurtosis : Apply only the fourth-order coefficients.
+
+        Notes
+        -----
+        The current window supplies separate bases for correlation and
+        cokurtosis. Historical coefficients are assigned by rank in each
+        basis. Correlation is rescaled congruently to unit diagonal before
+        current marginal volatilities are restored. The fourth-order core
+        retains its own diagonal; it is not normalized to one.
 
         Examples
         --------
-        >>> # core was calibrated using only observations before row 90.
-        >>> model = core.fit(returns[80:100], as_of=99)  # doctest: +SKIP
+        >>> import numpy as np
+        >>> from hoao import ReturnsPanel, calibrate
+        >>> history = 0.01 * np.random.default_rng(2).normal(size=(100, 5))
+        >>> calibration = calibrate(ReturnsPanel(history), n_assets=3,
+        ...                         train_size=20, test_size=10, n_pairs=4,
+        ...                         before=80, random_state=7)
+        >>> current = history[-20:, :3]
+        >>> model = calibration.fit(current, as_of=99)
+        >>> np.allclose(np.diag(model.covariance), current.var(axis=0))
+        True
         """
         x, z, mean, scales, assets = self._fitting_data(returns, as_of)
         _, u2 = correlation_basis(z, device=device)
@@ -215,26 +282,52 @@ class Calibration:
 
     def fit_correlation(self, returns: ReturnInput, *, as_of: Cutoff | None = None,
                         device: Device = "cpu") -> CorrelationEstimate:
-        """Fit only AO correlation and covariance, skipping fourth-order work.
+        """Apply AO coefficients to estimate current correlation and covariance.
 
         Parameters
         ----------
-        returns : pandas.DataFrame or array_like, shape (train_size, n_assets)
-            Current finite returns with positive variance in every column.
+        returns : array_like or pandas.DataFrame, shape (train_size, n_assets)
+            Finite current returns with positive variance in every column.
+            Dimensions and DataFrame labels must meet the requirements of
+            :meth:`fit`.
         as_of : date-like or int, optional
-            Signal date, inferred from a dated DataFrame's final row. Required
-            for arrays. The same causal checks as :meth:`fit` apply.
-        device : {"cpu", "cuda"}, default="cpu"
-            Backend for the current correlation basis.
+            Application date or absolute row position. Required for arrays;
+            otherwise inferred from the final DataFrame index entry. The
+            chronology checks are the same as for :meth:`fit`.
+        device : {'cpu', 'cuda'}, default='cpu'
+            Backend for the current correlation basis. CUDA is experimental
+            and requires CuPy and a working NVIDIA driver.
 
         Returns
         -------
         CorrelationEstimate
-            Unit-diagonal correlation and covariance in current return units.
+            Unit-diagonal correlation, current marginal standard deviations
+            and covariance in squared return units. No fourth-order basis
+            or tensor is computed.
+
+        Raises
+        ------
+        TypeError
+            If returns do not have a real numeric dtype.
+        ValueError
+            If fitting data, dimensions, labels, chronology or device are
+            invalid.
+        ImportError
+            If CUDA is requested but CuPy is not installed.
+        RuntimeError
+            If the requested CUDA device cannot be initialized.
 
         Examples
         --------
-        >>> c = core.fit_correlation(returns[80:100], as_of=99)  # doctest: +SKIP
+        >>> import numpy as np
+        >>> from hoao import ReturnsPanel, calibrate
+        >>> history = np.random.default_rng(2).normal(size=(100, 5))
+        >>> calibration = calibrate(ReturnsPanel(history), n_assets=3,
+        ...                         train_size=20, test_size=10, n_pairs=4,
+        ...                         before=80, random_state=7)
+        >>> estimate = calibration.fit_correlation(history[-20:, :3], as_of=99)
+        >>> np.allclose(np.diag(estimate.correlation), 1.0)
+        True
         """
         _, z, _, scales, assets = self._fitting_data(returns, as_of)
         _, u = correlation_basis(z, device=device)
@@ -243,27 +336,57 @@ class Calibration:
 
     def fit_cokurtosis(self, returns: ReturnInput, *, as_of: Cutoff | None = None,
                       device: Device = "cpu") -> CokurtosisEstimate:
-        """Fit only HOAO even cokurtosis, skipping correlation estimation.
+        """Apply the HOAO even core in the current fourth-order basis.
 
         Parameters
         ----------
-        returns : pandas.DataFrame or array_like, shape (train_size, n_assets)
-            Current finite returns with positive variance in every column.
+        returns : array_like or pandas.DataFrame, shape (train_size, n_assets)
+            Finite current returns with positive variance in every column.
+            Dimensions and DataFrame labels must meet the requirements of
+            :meth:`fit`.
         as_of : date-like or int, optional
-            Signal date, inferred from a dated DataFrame's final row. Required
-            for arrays. The same causal checks as :meth:`fit` apply.
-        device : {"cpu", "cuda"}, default="cpu"
-            Backend for the current fourth-moment basis.
+            Application date or absolute row position. Required for arrays;
+            otherwise inferred from the final DataFrame index entry. The
+            chronology checks are the same as for :meth:`fit`.
+        device : {'cpu', 'cuda'}, default='cpu'
+            Backend for the current fourth-order basis. CUDA is experimental
+            and requires CuPy and a working NVIDIA driver.
 
         Returns
         -------
         CokurtosisEstimate
-            Compact fourth central moments in current return units. The
-            standardized dependence tensor is never rescaled to unit diagonal.
+            Current basis, historical even core and current marginal
+            volatilities. Portfolio fourth moments use the original return
+            units. Correlation estimation is skipped.
+
+        Raises
+        ------
+        TypeError
+            If returns do not have a real numeric dtype.
+        ValueError
+            If fitting data, dimensions, labels, chronology or device are
+            invalid.
+        ImportError
+            If CUDA is requested but CuPy is not installed.
+        RuntimeError
+            If the requested CUDA device cannot be initialized.
 
         Examples
         --------
-        >>> k = core.fit_cokurtosis(returns[80:100], as_of=99)  # doctest: +SKIP
+        The fitted estimate keeps the calibrated core and supplies a new
+        basis for the current window:
+
+        >>> import numpy as np
+        >>> from hoao import ReturnsPanel, calibrate
+        >>> history = np.random.default_rng(2).normal(size=(100, 5))
+        >>> calibration = calibrate(ReturnsPanel(history), n_assets=3,
+        ...                         train_size=20, test_size=10, n_pairs=4,
+        ...                         before=80, random_state=7)
+        >>> estimate = calibration.fit_cokurtosis(history[-20:, :3], as_of=99)
+        >>> np.array_equal(estimate.core, calibration.cokurtosis_core)
+        True
+        >>> estimate.basis.shape
+        (3, 3)
         """
         _, z, _, scales, assets = self._fitting_data(returns, as_of)
         return CokurtosisEstimate(scales=scales, basis=fourth_basis(z, device=device),
@@ -272,39 +395,76 @@ class Calibration:
     def update(self, panel: ReturnsPanel, *, n_pairs: int, before: Cutoff,
                start: Cutoff | None = None, n_jobs: int = 1,
                device: Device = "cpu") -> Calibration:
-        """Add historical pairs without resetting accumulated sums or counts.
+        """Add historical pairs to the existing calibration.
 
         Parameters
         ----------
         panel : ReturnsPanel
-            Return history and point-in-time universe. Its date convention
-            must match the original calibration. Asset identities may differ.
+            History and availability for the new draws. It must use the same
+            dated or positional convention as the original panel, but may
+            contain different assets. The saved asset count, window lengths,
+            gap and missing-return policy continue to apply.
         n_pairs : int
-            Number of additional pairs, sampled with the saved seed and the
-            next consecutive pair IDs.
+            Positive number of additional pairs. Sampling continues from the
+            saved seed and next pair ID; earlier pairs retain their weight.
         before : date-like or int
-            Exclusive target cutoff, no earlier than the previous cutoff.
+            Exclusive cutoff for all new target observations. It must be no
+            earlier than the previous cutoff. Use a date for a dated panel
+            and an absolute row position for a positional panel.
         start : date-like or int, optional
-            Inclusive lower bound for signal dates. None uses all available
-            history; specify the previous update date to sample only recent
-            signal dates. Training history may precede this bound.
+            Inclusive lower bound for new signal dates. If omitted, sample
+            from all eligible dates before the cutoff, including old dates.
+            Set a later bound to restrict the new draws to a recent period;
+            their training windows may begin before that bound.
         n_jobs : int, default=1
-            CPU workers. Work in flight is bounded by twice this number, BLAS
-            threads are capped during concurrent work, and results are added
-            in pair order. CUDA requires one worker.
-        device : {"cpu", "cuda"}, default="cpu"
-            Backend for each pair. GPU work uses batches of at most four pairs
-            to bound memory while sharing transfers and linear algebra.
+            Positive number of CPU workers. Results are accumulated in pair
+            order, with BLAS limited to one thread during calibration. CUDA
+            requires ``n_jobs=1``.
+        device : {'cpu', 'cuda'}, default='cpu'
+            Numerical backend. CUDA is experimental and requires CuPy and a
+            working NVIDIA driver; it processes at most four pairs per batch.
 
         Returns
         -------
         Calibration
-            This object, updated only after every requested pair succeeds.
-            A failure leaves the existing calibration unchanged.
+            This object, with new sums, count, cutoff and missing-return
+            records. Changes are committed only after all new pairs succeed;
+            a failed update leaves the existing calibration unchanged.
+
+        Raises
+        ------
+        TypeError
+            If `panel` is not a ReturnsPanel.
+        ValueError
+            If settings or date conventions are incompatible, no eligible
+            pairs exist, or a target NaN is encountered with ``missing='raise'``.
+        ImportError
+            If CUDA is requested but CuPy is not installed.
+        RuntimeError
+            If the requested CUDA device cannot be initialized.
+
+        See Also
+        --------
+        calibrate : Sampling rules and independent window standardization.
+        save : Preserve the updated sums and sampling state.
 
         Examples
         --------
-        >>> core.update(panel, n_pairs=20, before=120)  # doctest: +SKIP
+        Splitting eight draws into two calls gives the same cores as one
+        eight-pair calibration when the panel, bounds and seed are unchanged:
+
+        >>> import numpy as np
+        >>> from hoao import ReturnsPanel, calibrate
+        >>> panel = ReturnsPanel(np.random.default_rng(2).normal(size=(100, 5)))
+        >>> settings = dict(n_assets=3, train_size=20, test_size=10,
+        ...                 before=80, random_state=7)
+        >>> calibration = calibrate(panel, n_pairs=4, **settings)
+        >>> _ = calibration.update(panel, n_pairs=4, before=80, n_jobs=2)
+        >>> uninterrupted = calibrate(panel, n_pairs=8, **settings)
+        >>> calibration.n_pairs
+        8
+        >>> np.array_equal(calibration.cokurtosis_core, uninterrupted.cokurtosis_core)
+        True
         """
         if not isinstance(panel, ReturnsPanel):
             raise TypeError("panel must be a ReturnsPanel")
@@ -401,18 +561,53 @@ class Calibration:
         return self
 
     def save(self, path: str | Path) -> None:
-        """Save accumulated state as NPZ arrays and versioned JSON metadata.
+        """Save the calibration coefficients and the state needed to resume it.
 
         Parameters
         ----------
         path : str or pathlib.Path
-            Destination file. The exact supplied name is used, preferably
-            ending in ``.npz``. A temporary sibling file is flushed and synced
-            before atomic replacement; failed writes preserve an existing file.
+            Destination filename, conventionally ending in ``.npz``. The
+            exact name is used; no extension is appended. An existing file
+            at this path is replaced only after the new file is complete.
+
+        Raises
+        ------
+        ValueError
+            If the calibration contains no pairs.
+        OSError
+            If the destination cannot be written or replaced.
+
+        See Also
+        --------
+        load : Restore a saved calibration and validate its contents.
+
+        Notes
+        -----
+        The NPZ archive contains numeric arrays and versioned JSON metadata,
+        with no pickle. It preserves sums rather than only averages, so a
+        later update gives old and new pairs equal weight. The return panel
+        itself is not saved. Writes use a temporary file in the destination
+        directory and atomic replacement; a failed write preserves any
+        previously saved calibration at that path.
 
         Examples
         --------
-        >>> core.save("historical-core.npz")  # doctest: +SKIP
+        >>> import numpy as np
+        >>> from pathlib import Path
+        >>> from tempfile import TemporaryDirectory
+        >>> from hoao import Calibration, ReturnsPanel, calibrate
+        >>> panel = ReturnsPanel(np.random.default_rng(2).normal(size=(100, 5)))
+        >>> calibration = calibrate(panel, n_assets=3, train_size=20,
+        ...                         test_size=10, n_pairs=4, before=80,
+        ...                         random_state=7)
+        >>> with TemporaryDirectory() as directory:
+        ...     path = Path(directory) / "calibration.npz"
+        ...     calibration.save(path)
+        ...     restored = Calibration.load(path)
+        >>> restored.n_pairs
+        4
+        >>> np.array_equal(restored.cokurtosis_core, calibration.cokurtosis_core)
+        True
         """
         if self.n_pairs < 1 or self.latest_target is None:
             raise ValueError("Cannot save an empty calibration")
@@ -443,29 +638,48 @@ class Calibration:
 
     @classmethod
     def load(cls, path: str | Path) -> Calibration:
-        """Load and validate a non-pickle calibration checkpoint.
+        """Restore and validate a calibration saved with :meth:`save`.
 
         Parameters
         ----------
         path : str or pathlib.Path
-            Checkpoint produced by :meth:`save` using this schema and basis
-            convention. Incompatible versions and malformed state are rejected.
+            NPZ file produced by a compatible schema and basis convention.
 
         Returns
         -------
         Calibration
-            Historical sums, exact count, sampling seed, and causal cutoffs.
+            Restored coefficient sums, pair count, sampling seed, dimensions,
+            cutoffs and missing-return records. It can be used immediately
+            for fitting or extended by :meth:`update` with a return panel.
 
         Raises
         ------
         ValueError
-            If metadata, shapes, counts, finite values, or cutoff chronology
-            are invalid. Object arrays and pickle are never accepted.
+            If the file's schema or basis convention is incompatible, or its
+            metadata, array values, dimensions, counts or chronology fail
+            validation. Object arrays and pickle are not accepted.
+        OSError
+            If the file cannot be opened or read.
 
         Examples
         --------
-        >>> from hoao import Calibration
-        >>> core = Calibration.load("historical-core.npz")  # doctest: +SKIP
+        A restored calibration continues the original pair sequence:
+
+        >>> import numpy as np
+        >>> from pathlib import Path
+        >>> from tempfile import TemporaryDirectory
+        >>> from hoao import Calibration, ReturnsPanel, calibrate
+        >>> panel = ReturnsPanel(np.random.default_rng(2).normal(size=(100, 5)))
+        >>> calibration = calibrate(panel, n_assets=3, train_size=20,
+        ...                         test_size=10, n_pairs=4, before=80,
+        ...                         random_state=7)
+        >>> with TemporaryDirectory() as directory:
+        ...     path = Path(directory) / "calibration.npz"
+        ...     calibration.save(path)
+        ...     restored = Calibration.load(path)
+        >>> _ = restored.update(panel, n_pairs=2, before=80)
+        >>> restored.n_pairs, calibration.n_pairs
+        (6, 4)
         """
         try:
             with np.load(path, allow_pickle=False) as state:
@@ -556,74 +770,123 @@ def calibrate(panel: ReturnsPanel, *, n_assets: int, train_size: int,
               gap: int = 1, missing: MissingPolicy = "zero",
               random_state: int | None = None, n_jobs: int = 1,
               device: Device = "cpu") -> Calibration:
-    """Calibrate AO correlation and HOAO cokurtosis from a return panel.
+    """Estimate AO correlation and HOAO cokurtosis coefficients from history.
+
+    Each draw selects a signal date and an asset subset, estimates bases
+    from the trailing training window, and measures coefficients in the
+    subsequent target window. The returned calibration averages these
+    coefficients by rank for application to later return windows.
 
     Parameters
     ----------
     panel : ReturnsPanel
-        Return history and optional daily available stocks. Only complete,
-        nonconstant training histories can enter a sampled asset subset.
+        Return history and asset availability known on each date. A
+        candidate asset must have a complete, finite, nonconstant
+        training history ending on the selected signal date.
     n_assets : int
-        Assets sampled uniformly without replacement on each signal date.
-        Calibration is specific to this count, not to asset identities.
+        Positive number of assets selected uniformly without replacement
+        on each date. The selected assets remain fixed throughout the
+        target window. Calibration depends on this count, not on the
+        particular asset identities.
     train_size, test_size : int
-        Observations in each training and subsequent target window, each at
-        least three. Training ends on the sampled signal date. Each window is
-        centered and standardized using its own population standard deviations.
-        A constant target component is retained as zero after standardization.
+        Observations in the training and target windows, each at least
+        three. Training ends on the signal date. Each window is centered
+        and standardized independently with ``ddof=0``. A constant
+        target column is retained as zero after standardization.
     n_pairs : int
-        Number of historical pairs. Each pair has equal weight in both cores.
+        Positive number of historical pairs. Each contributes equally
+        to both coefficient averages.
     before : date-like or int
-        Exclusive upper bound for *all target observations*. Use a date for a
-        dated panel and an absolute row position otherwise. This cutoff is
-        checked when the calibrated core is subsequently applied.
+        Exclusive upper bound for every target observation. Use a date
+        for a dated panel and an absolute row position otherwise. Later
+        application dates must be at least this cutoff.
     start : date-like or int, optional
-        Inclusive lower bound for signal dates. Training history may precede
-        it. None uses all signal dates with enough available history.
+        Inclusive lower bound for signal dates. Training windows may
+        begin earlier. If omitted, all dates with enough training history
+        and target dates before the cutoff are considered.
     gap : int, default=1
-        Sessions skipped between training and target windows. With one, a
-        signal after session t's close is executed on t+1 and targets start
-        on t+2. Zero makes the windows adjacent.
-    missing : {"zero", "raise"}, default="zero"
-        Policy for target NaNs **after** selecting stocks. "zero" reproduces
-        the paper's explicit zero-return marking convention and records every
-        filled location. "raise" stops without substituting stocks or dates.
-        Missing training returns always exclude that asset from eligibility;
-        infinity is always an error. Zero filling does not establish an exit.
+        Nonnegative number of observations skipped between windows. With
+        a signal on row ``t``, the first target row is ``t + gap + 1``.
+        The default skips the execution day of the manuscript's protocol;
+        zero makes the two windows adjacent.
+    missing : {'zero', 'raise'}, default='zero'
+        Policy for NaNs in the selected target returns. ``'zero'`` uses
+        the manuscript's zero-return convention and records each filled
+        location. ``'raise'`` stops at a missing target return without
+        choosing replacement assets or dates. Missing training returns
+        always exclude the asset, and the panel rejects infinities.
     random_state : int or None, default=None
-        Nonnegative sampling seed. Each pair has an independent stream based
-        on its stable ID. The seed is saved for exact continuation.
+        Nonnegative sampling seed. None generates a fresh seed. Each pair
+        uses a stream determined by the seed and its sequential pair ID;
+        both the seed and pair count are retained for continuation.
     n_jobs : int, default=1
-        Number of bounded CPU workers; results are accumulated in pair order.
-        CUDA requires one worker. Concurrent CPU work limits BLAS to one thread
-        per worker to avoid oversubscription.
-    device : {"cpu", "cuda"}, default="cpu"
-        Numerical backend. CUDA needs the optional CuPy dependency and a GPU;
-        pairs run in batches of at most four to bound memory. Public outputs
-        remain NumPy.
+        Positive number of CPU workers. At most twice this many pairs
+        are in flight, BLAS uses one thread during calibration, and
+        results are accumulated in pair order. CUDA requires one worker.
+    device : {'cpu', 'cuda'}, default='cpu'
+        Numerical backend. Experimental CUDA support requires CuPy and a
+        working NVIDIA driver, and processes up to four pairs per batch.
+        Public results are NumPy float64 arrays with either backend.
 
     Returns
     -------
     Calibration
-        Historical compact cores, dimensions, count, cutoff, and fill records.
+        Averaged second- and fourth-order coefficients with the sums,
+        count, dimensions, cutoffs and missing-return records needed for
+        fitting, inspection, persistence and subsequent updates.
+
+    Raises
+    ------
+    TypeError
+        If `panel` is not a ReturnsPanel.
+    ValueError
+        If parameters are invalid, no admissible dates have enough
+        eligible assets, or a selected target contains NaN with
+        ``missing='raise'``.
+    ImportError
+        If CUDA is requested but CuPy is not installed.
+    RuntimeError
+        If the requested CUDA device cannot be initialized.
+
+    See Also
+    --------
+    ReturnsPanel : Availability formats and trailing-history eligibility.
+    Calibration.fit : Apply the coefficients to a current return window.
+    CV : Estimate coefficients from random splits of one current window.
 
     Notes
     -----
-    Signal dates are uniform among dates meeting training-history and calendar
-    constraints. Assets are uniform within that date's eligible universe.
-    Target values cannot change either selection. No annualization is applied.
+    Dates are drawn uniformly with replacement from those meeting the
+    training-history and calendar requirements. Assets are then drawn
+    uniformly within that date's eligible universe. Target return values
+    affect neither selection step. The same windows supply both orders,
+    using separate correlation and fourth-order bases.
+
+    Zero filling is an explicit modeling convention for missing target
+    data; a NaN alone does not establish that a stock exited the universe.
+    Use the stored count and locations to inspect how often it applies.
 
     Examples
     --------
+    With a dated DataFrame, the application date is inferred from the
+    last row of the current window:
+
     >>> import numpy as np
+    >>> import pandas as pd
     >>> from hoao import ReturnsPanel, calibrate
-    >>> data = np.random.default_rng(10).normal(size=(100, 4)) * 0.01
-    >>> core = calibrate(ReturnsPanel(data), n_assets=3, train_size=20,
-    ...                  test_size=10, n_pairs=5, before=80, random_state=4)
-    >>> core.cokurtosis_core.shape
-    (3, 3)
-    >>> core.n_pairs
-    5
+    >>> history = pd.DataFrame(
+    ...     0.01 * np.random.default_rng(10).normal(size=(120, 4)),
+    ...     index=pd.bdate_range("2020-01-01", periods=120),
+    ...     columns=["A", "B", "C", "D"],
+    ... )
+    >>> calibration = calibrate(ReturnsPanel(history), n_assets=3,
+    ...                         train_size=20, test_size=10, n_pairs=5,
+    ...                         before=history.index[80], random_state=4)
+    >>> model = calibration.fit(history.iloc[-20:, :3])
+    >>> model.assets
+    ('A', 'B', 'C')
+    >>> calibration.n_pairs, calibration.filled_count
+    (5, 0)
     """
     if not isinstance(panel, ReturnsPanel):
         raise TypeError("panel must be a ReturnsPanel")

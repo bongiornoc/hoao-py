@@ -1,4 +1,10 @@
-"""Compact fitted estimates and portfolio-level results."""
+"""Fitted correlation and cokurtosis estimates and their portfolio moments.
+
+Estimators return a MomentModel when both orders are requested, or a
+CorrelationEstimate or CokurtosisEstimate when only one is needed.
+These objects retain the asset order and marginal scales of the fitting
+window. Portfolio calculations use the original return units.
+"""
 from __future__ import annotations
 
 from collections.abc import Hashable, Sequence
@@ -17,29 +23,45 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PortfolioMoments:
-    """Central moments of a portfolio in the input return units.
+    """Estimated mean, variance and fourth central moment of a portfolio.
+
+    Returned by :meth:`MomentModel.portfolio` and included in every
+    :class:`OptimizationResult`. The record is immutable. Its values refer
+    to one observation period at the frequency of the fitting data; no
+    annualization is applied.
 
     Attributes
     ----------
     mean : float
-        Weighted sample mean of the fitting returns.
+        Weighted sample mean of the fitting returns, in return units.
     variance : float
         Estimated second central moment, in squared return units.
     volatility : float
-        Square root of variance, without annualization.
+        Square root of `variance`, in return units.
     fourth_moment : float
-        Estimated fourth central moment, in fourth-power return units.
+        Estimated fourth central moment, in return units to the fourth
+        power. This is an unstandardized moment, not a kurtosis.
     kurtosis : float
-        Pearson kurtosis: fourth moment divided by variance squared.
-        NaN when variance is zero. Separately filtered moments may give
-        values below one; the value is not clipped.
+        Pearson kurtosis, ``fourth_moment / variance**2``. Three is not
+        subtracted. The value is NaN when variance is zero.
+
+    Notes
+    -----
+    A distribution with positive variance has Pearson kurtosis at least
+    one. Separately filtered covariance and cokurtosis need not be moments
+    of the same distribution, so their ratio can fall below one. Such a
+    result is retained, as discussed in the accompanying manuscript.
 
     Examples
     --------
+    >>> import numpy as np
     >>> from hoao import Sample
-    >>> risk = Sample().fit([[0.01], [-0.02], [0.03]]).portfolio([1.0])
-    >>> risk.variance > 0
+    >>> returns = np.array([[-0.01], [0.0], [0.01]])
+    >>> moments = Sample().fit(returns).portfolio([1.0])
+    >>> bool(np.isclose(moments.variance, np.var(returns)))
     True
+    >>> round(moments.kurtosis, 6)
+    1.5
     """
 
     mean: float
@@ -50,34 +72,58 @@ class PortfolioMoments:
 
 
 class CorrelationEstimate:
-    """A correlation estimate with current marginal return volatilities.
+    """Correlation and covariance fitted to a window of asset returns.
 
-    Normally returned by an estimator's ``fit_correlation`` method.
+    Returned by an estimator's ``fit_correlation`` method. The correlation
+    describes dependence; the marginal standard deviations convert it to a
+    covariance in the units of the current fitting window.
 
     Parameters
     ----------
     correlation : ndarray of float64, shape (n_assets, n_assets)
-        Symmetric positive semidefinite matrix with diagonal one.
+        Finite, symmetric, positive semidefinite matrix with unit diagonal.
     scales : ndarray of float64, shape (n_assets,)
-        Positive sample standard deviations, computed with ``ddof=0``.
+        Finite, strictly positive marginal standard deviations. Estimators
+        compute these from the current returns with ``ddof=0``.
     assets : sequence of hashable, optional
-        Unique labels in matrix-column order.
+        Unique, non-missing labels in matrix order. If omitted, arrays are
+        interpreted by position.
 
     Attributes
     ----------
-    correlation, covariance : ndarray of float64
-        Read-only square arrays. Covariance is scaled to return units.
-    scales : ndarray of float64
-        Read-only marginal volatilities.
+    correlation : ndarray of float64, shape (n_assets, n_assets)
+        Read-only correlation matrix.
+    covariance : ndarray of float64, shape (n_assets, n_assets)
+        Read-only covariance matrix,
+        ``correlation * np.outer(scales, scales)``.
+    scales : ndarray of float64, shape (n_assets,)
+        Read-only marginal standard deviations, in return units.
     assets : tuple of hashable or None
-        Asset labels, when supplied by the fitting data.
+        Asset labels in array order, or None for unlabeled input.
+
+    Raises
+    ------
+    ValueError
+        If dimensions disagree, values are non-finite, scales are not
+        positive, the correlation is invalid, or labels are invalid.
+
+    See Also
+    --------
+    Sample.fit_correlation : Estimate sample correlation and covariance.
+    CV.fit_correlation : Estimate correlation by cross-validation.
+    Calibration.fit_correlation : Apply historical AO coefficients.
 
     Examples
     --------
-    >>> from hoao import Sample
-    >>> estimate = Sample().fit_correlation([[1., 2.], [2., 1.], [4., 3.]])
-    >>> estimate.correlation.shape
-    (2, 2)
+    The covariance diagonal retains the current sample variances even
+    when the correlation has been filtered:
+
+    >>> import numpy as np
+    >>> from hoao import CV
+    >>> returns = 0.01 * np.random.default_rng(4).standard_t(5, size=(100, 3))
+    >>> estimate = CV(random_state=7).fit_correlation(returns)
+    >>> np.allclose(np.diag(estimate.covariance), returns.var(axis=0))
+    True
     """
 
     correlation: FloatArray
@@ -105,32 +151,37 @@ class CorrelationEstimate:
         self.assets = labels(assets, len(s)) if assets is not None else None
 
     def to_pandas(self, kind: Literal["correlation", "covariance"] = "correlation") -> pd.DataFrame:
-        """Return a labeled copy of the correlation or covariance matrix.
+        """Export the correlation or covariance as a labeled DataFrame.
 
         Parameters
         ----------
-        kind : {'correlation', 'covariance'}, default 'correlation'
-            Matrix to export. Covariance retains the input return units.
+        kind : {'correlation', 'covariance'}, default='correlation'
+            Matrix to export. Correlation is dimensionless; covariance is in
+            squared return units at the original observation frequency.
 
         Returns
         -------
-        pandas.DataFrame
-            Shape ``(n_assets, n_assets)``. Uses integer labels if the
-            estimate was fitted from an unlabeled array.
+        pandas.DataFrame, shape (n_assets, n_assets)
+            An independent copy with asset labels on both axes. For an
+            unlabeled estimate, both axes use integer positions.
 
         Raises
         ------
         ImportError
-            If pandas is not installed; install ``hoao[pandas]``.
+            If pandas is not installed.
         ValueError
-            If ``kind`` does not name a supported matrix.
+            If `kind` is neither ``'correlation'`` nor ``'covariance'``.
 
         Examples
         --------
+        >>> import pandas as pd
         >>> from hoao import Sample
-        >>> estimate = Sample().fit_correlation([[1.], [2.], [3.]])
-        >>> estimate.to_pandas().iloc[0, 0]
-        np.float64(1.0)
+        >>> returns = pd.DataFrame({"A": [0.01, -0.02, 0.03],
+        ...                         "B": [-0.01, 0.01, 0.02]})
+        >>> estimate = Sample().fit_correlation(returns)
+        >>> covariance = estimate.to_pandas("covariance")
+        >>> covariance.index.tolist(), covariance.columns.tolist()
+        (['A', 'B'], ['A', 'B'])
         """
         import pandas as pd
         if kind not in ("correlation", "covariance"):
@@ -140,41 +191,91 @@ class CorrelationEstimate:
 
 
 class CokurtosisEstimate:
-    """A fourth central moment represented without a dense fourth tensor.
+    """Fourth central co-moments stored for direct portfolio evaluation.
 
-    Use ``Sample``, ``CV`` or ``Calibration`` to construct this estimate.
-    The sample estimator retains centered observations. Filtered estimators
-    retain an orthogonal basis and the even-core matrix of squared rotated
-    returns. No odd-order moment is estimated by this object.
+    Obtain an estimate from ``Sample``, ``CV`` or ``Calibration``. The
+    unfiltered sample estimate retains centered returns. The even sample,
+    CV and HOAO estimates retain a fourth-order basis and an even-core
+    matrix. Neither representation requires a dense fourth-order tensor.
 
     Parameters
     ----------
     scales : ndarray of float64, shape (n_assets,)
-        Positive current sample marginal volatilities.
+        Finite, strictly positive sample standard deviations of the
+        fitting returns, computed with ``ddof=0``.
     basis : ndarray of float64, shape (n_assets, n_assets), optional
-        Orthogonal fourth-order basis in standardized coordinates.
+        Orthogonal basis for the fourth moment of standardized returns.
+        Columns are basis vectors, ordered by decreasing singular value
+        of the sample fourth tensor's mode-one unfolding.
     core : ndarray of float64, shape (n_assets, n_assets), optional
-        Even-core matrix, produced by the library's estimation procedures.
-        Arbitrary user-created cores are not a supported estimation method.
+        Symmetric, nonnegative even-core matrix in `basis` coordinates.
+        Its entries estimate ``mean(Y[:, i]**2 * Y[:, j]**2)`` for
+        centered, rotated, standardized observations ``Y``.
     centered : ndarray of float64, shape (n_observations, n_assets), optional
-        Raw centered return observations for the sample estimator. Supply
-        this instead of ``basis`` and ``core``.
+        Finite, column-centered observations in original return units.
+        Supply these for an exact sample estimate, or supply both `basis`
+        and `core` for an even estimate; the two representations are
+        mutually exclusive.
     assets : sequence of hashable, optional
-        Unique asset labels in column order.
+        Unique, non-missing asset labels in column order.
 
     Attributes
     ----------
-    scales, basis, core, centered : ndarray of float64 or None
-        Read-only numerical representation. Unused components are None.
+    scales : ndarray of float64, shape (n_assets,)
+        Read-only marginal standard deviations.
+    basis, core : ndarray of float64, shape (n_assets, n_assets), or None
+        Read-only basis and even core. Both are None for the unfiltered
+        sample estimate.
+    centered : ndarray of float64, shape (n_observations, n_assets), or None
+        Read-only centered returns for the sample estimate; None for an
+        even estimate.
     assets : tuple of hashable or None
-        Labels used to align pandas weight Series.
+        Labels used to align pandas weight Series, or None for unlabeled
+        estimates.
+
+    Raises
+    ------
+    ValueError
+        If the representation is incomplete, its dimensions or values
+        are invalid, the basis is not orthogonal, the core is not
+        symmetric and nonnegative, or asset labels are invalid.
+
+    See Also
+    --------
+    Sample : Exact sample moments or the even-core sample projection.
+    CV : Estimate an even core from random splits of a return window.
+    calibrate : Estimate an even core from historical window pairs.
+
+    Notes
+    -----
+    For an even estimate, let ``v = basis.T @ (scales * weights)`` and
+    ``q = v**2``. The portfolio fourth moment is
+    ``3 * q @ core @ q - 2 * np.diag(core) @ v**4``. The coefficient
+    three accounts for the six permutations of each paired-index term;
+    the subtraction counts each four-equal-index term only once.
+    Evaluation, gradients and Hessian-vector products cost
+    ``O(n_assets**2)``. For the sample representation they cost
+    ``O(n_observations * n_assets)``.
+
+    Use the estimators to construct cores from observations. Symmetry and
+    nonnegative entries alone do not establish that an arbitrary supplied
+    core is a valid moment estimate.
 
     Examples
     --------
+    >>> import numpy as np
     >>> from hoao import Sample
-    >>> fourth = Sample(even=True).fit_cokurtosis([[1.], [2.], [3.]])
-    >>> round(fourth.fourth_moment([1.]), 6)
-    0.666667
+    >>> returns = 0.01 * np.random.default_rng(2).standard_t(5, size=(100, 3))
+    >>> estimate = Sample(even=True).fit_cokurtosis(returns)
+    >>> estimate.basis.shape, estimate.core.shape
+    ((3, 3), (3, 3))
+
+    Doubling every position multiplies the fourth moment by sixteen:
+
+    >>> weights = np.array([0.5, 0.3, 0.2])
+    >>> ratio = estimate.fourth_moment(2 * weights) / estimate.fourth_moment(weights)
+    >>> bool(np.isclose(ratio, 16.0))
+    True
     """
 
     scales: FloatArray
@@ -232,27 +333,44 @@ class CokurtosisEstimate:
         return float(value), gradient
 
     def fourth_moment(self, weights: WeightInput) -> float:
-        """Evaluate the portfolio fourth central moment in return units.
+        """Evaluate the fourth central moment of a weighted portfolio.
 
         Parameters
         ----------
         weights : array_like or pandas.Series, shape (n_assets,)
-            Finite positions; short positions and non-unit budgets are
-            allowed. A Series is aligned by exact asset labels.
+            Finite real positions. Short positions and non-unit budgets are
+            allowed. Arrays follow the fitting-data column order. A Series
+            must contain each asset label exactly once and is reordered to
+            match the estimate; missing or additional labels are errors.
 
         Returns
         -------
         float
-            Fourth central moment, without annualization. A filtered
-            estimate costs O(n_assets**2); the sample estimate costs
-            O(n_observations * n_assets).
+            Fourth central moment in return units to the fourth power, at the
+            frequency of the fitting data. This is not divided by variance.
+
+        Raises
+        ------
+        TypeError
+            If weights do not have a real numeric dtype.
+        ValueError
+            If weights have the wrong shape, contain non-finite
+            values, or have labels incompatible with the estimate.
 
         Examples
         --------
+        For the sample estimator, evaluation agrees with the fourth power of
+        centered portfolio returns:
+
+        >>> import numpy as np
         >>> from hoao import Sample
-        >>> k = Sample().fit_cokurtosis([[-1.], [0.], [1.]])
-        >>> round(k.fourth_moment([1.]), 6)
-        0.666667
+        >>> returns = np.random.default_rng(3).normal(size=(100, 3))
+        >>> estimate = Sample().fit_cokurtosis(returns)
+        >>> weights = np.array([0.6, 0.5, -0.1])
+        >>> realized = returns @ weights
+        >>> expected = np.mean((realized - realized.mean())**4)
+        >>> bool(np.isclose(estimate.fourth_moment(weights), expected))
+        True
         """
         w = weights_array(weights, len(self.scales), self.assets)
         return self._value_gradient(w)[0]
@@ -263,44 +381,84 @@ class CokurtosisEstimate:
         Parameters
         ----------
         weights : array_like or pandas.Series, shape (n_assets,)
-            Evaluation weights. A Series must match all asset labels.
+            Finite real weights at which to evaluate the derivative. A Series
+            is aligned by the estimate's asset labels, with the same checks
+            as :meth:`fourth_moment`.
 
         Returns
         -------
         ndarray of float64, shape (n_assets,)
-            Analytic gradient in model asset order, in return units.
+            Analytic derivative in model asset order. Each entry measures the
+            change in the fourth moment per unit change in that asset's
+            weight. The derivative is unconstrained: it does not impose a
+            unit budget.
+
+        Raises
+        ------
+        TypeError
+            If weights do not have a real numeric dtype.
+        ValueError
+            If weights or their labels are invalid.
+
+        See Also
+        --------
+        hessian_vector_product : Directional derivative of the gradient.
 
         Examples
         --------
+        The fourth moment is homogeneous of degree four, so its gradient
+        satisfies ``weights @ gradient == 4 * fourth_moment``:
+
+        >>> import numpy as np
         >>> from hoao import Sample
-        >>> k = Sample().fit_cokurtosis([[-1.], [0.], [1.]])
-        >>> round(float(k.gradient([1.])[0]), 6)
-        2.666667
+        >>> returns = np.random.default_rng(3).normal(size=(100, 3))
+        >>> estimate = Sample(even=True).fit_cokurtosis(returns)
+        >>> weights = np.array([0.5, 0.3, 0.2])
+        >>> derivative = weights @ estimate.gradient(weights)
+        >>> bool(np.isclose(derivative, 4 * estimate.fourth_moment(weights)))
+        True
         """
         return self._value_gradient(weights_array(weights, len(self.scales), self.assets))[1]
 
     def hessian_vector_product(self, weights: WeightInput, direction: WeightInput) -> FloatArray:
-        """Apply the fourth-moment Hessian to a direction without forming it.
+        """Apply the fourth-moment Hessian to a direction in weight space.
 
         Parameters
         ----------
         weights : array_like or pandas.Series, shape (n_assets,)
-            Weights at which to evaluate the derivative.
+            Finite real weights at which to evaluate the Hessian.
         direction : array_like or pandas.Series, shape (n_assets,)
-            Direction vector, aligned using the same label rules as weights.
+            Finite real direction. Each Series is aligned independently by
+            asset label, using the same rules as :meth:`fourth_moment`.
 
         Returns
         -------
         ndarray of float64, shape (n_assets,)
-            Hessian times direction in model asset order. The compact
-            even-core path requires O(n_assets**2) operations.
+            Hessian times `direction`, in model asset order. The calculation
+            forms neither the full Hessian nor a fourth-order tensor.
+
+        Raises
+        ------
+        TypeError
+            If either vector does not have a real numeric dtype.
+        ValueError
+            If either vector or its labels are invalid.
 
         Examples
         --------
-        >>> from hoao import Sample
-        >>> k = Sample().fit_cokurtosis([[-1.], [0.], [1.]])
+        Compare the analytic product with a directional finite difference of
+        the gradient:
+
         >>> import numpy as np
-        >>> np.allclose(k.hessian_vector_product([1.], [1.]), [8.0])
+        >>> from hoao import Sample
+        >>> returns = np.random.default_rng(3).normal(size=(100, 3))
+        >>> estimate = Sample(even=True).fit_cokurtosis(returns)
+        >>> weights = np.array([0.5, 0.3, 0.2])
+        >>> direction = np.array([1.0, -1.0, 0.0])
+        >>> step = 1e-6
+        >>> difference = (estimate.gradient(weights + step * direction)
+        ...               - estimate.gradient(weights - step * direction)) / (2 * step)
+        >>> np.allclose(estimate.hessian_vector_product(weights, direction), difference)
         True
         """
         w = weights_array(weights, len(self.scales), self.assets)
@@ -315,40 +473,51 @@ class CokurtosisEstimate:
         return self._factor @ answer
 
     def to_dense(self, *, standardized: bool = False, max_bytes: int = 512 * 1024**2) -> FloatArray:
-        """Explicitly materialize the fourth-order tensor under a memory cap.
+        """Reconstruct the fourth-order tensor within a specified memory budget.
 
         Parameters
         ----------
-        standardized : bool, default False
-            If True, divide each tensor axis by its marginal volatility.
-            Otherwise return the tensor in raw return units.
-        max_bytes : int, default 536870912
-            Conservative cap for dense output plus work arrays. The method
-            raises before allocation if the estimate exceeds this cap.
+        standardized : bool, default=False
+            If False, return co-moments in the original return units. If
+            True, divide each axis by its marginal standard deviation. A
+            standardized fourth tensor does not generally have unit diagonal.
+        max_bytes : int, default=536870912
+            Positive upper bound for the estimated output and working storage
+            in bytes; the default is 512 MiB. The check precedes allocation.
 
         Returns
         -------
-        ndarray of float64, shape (n_assets,) * 4
-            Central cokurtosis. Axes follow the input asset order. In a
-            C-order unfolding, the last index varies fastest.
+        ndarray of float64, shape (n_assets, n_assets, n_assets, n_assets)
+            Symmetric fourth central co-moments. All axes follow model asset
+            order. In a C-order unfolding, the last index varies fastest.
 
         Raises
         ------
         MemoryError
-            If estimated dense working memory exceeds ``max_bytes``.
+            If estimated dense working memory exceeds `max_bytes`.
+        ValueError
+            If `max_bytes` is not a positive integer.
 
         Notes
         -----
-        Fitting, calibration and portfolio methods never call this method.
-        Dense tensors require O(n_assets**4) memory; use portfolio methods
-        for routine risk calculations.
+        The tensor alone occupies ``8 * n_assets**4`` bytes. The budget also
+        allows for reconstruction work arrays. Fitting, calibration and
+        portfolio calculations use the compact representation directly; dense
+        export is useful for small examples and comparisons with other code.
 
         Examples
         --------
+        Contracting a small dense tensor reproduces direct evaluation:
+
+        >>> import numpy as np
         >>> from hoao import Sample
-        >>> k = Sample().fit_cokurtosis([[-1.], [0.], [1.]])
-        >>> k.to_dense().shape
-        (1, 1, 1, 1)
+        >>> returns = np.random.default_rng(3).normal(size=(100, 3))
+        >>> estimate = Sample(even=True).fit_cokurtosis(returns)
+        >>> tensor = estimate.to_dense(max_bytes=1024**2)
+        >>> weights = np.array([0.5, 0.3, 0.2])
+        >>> dense_value = np.einsum("ijkl,i,j,k,l", tensor, weights, weights, weights, weights)
+        >>> bool(np.isclose(dense_value, estimate.fourth_moment(weights)))
+        True
         """
         n = len(self.scales)
         temporary = 8 * (4 * n**4 + (len(self.centered) * n * n if self.centered is not None else 0))
@@ -374,45 +543,72 @@ class CokurtosisEstimate:
 
 
 class MomentModel:
-    """Joint second- and fourth-moment estimates from one fitting window.
+    """Fitted moments for evaluating and optimizing asset portfolios.
 
-    Obtain a model from ``Sample.fit``, ``CV.fit`` or ``Calibration.fit``.
-    The mean is always the raw sample mean; filtering affects dependence.
+    Returned by ``Sample.fit``, ``CV.fit`` and ``Calibration.fit``. The
+    model combines the current sample mean and marginal volatilities with
+    the estimator's second- and fourth-order dependence estimates. It can
+    evaluate any finite weight vector or solve the variance–fourth-moment
+    allocation problem described in the manuscript.
 
     Parameters
     ----------
     mean : ndarray of float64, shape (n_assets,)
-        Sample mean of the current fitting window.
+        Finite sample means of the fitting returns.
     correlation_estimate : CorrelationEstimate
-        Correlation and current marginal volatilities.
+        Correlation and current marginal standard deviations.
     cokurtosis_estimate : CokurtosisEstimate
-        Fourth moment fitted to the same asset order and scale.
+        Fourth central co-moments with exactly the same marginal scales
+        and asset labels as `correlation_estimate`.
     reference_variance : float
-        Raw sample variance of equal-weight returns in the fitting window.
-        This common scale is used for every optimization penalty.
+        Raw sample variance of the equal-weight portfolio in the fitting
+        window, computed with ``ddof=0``. Must be finite and nonnegative;
+        optimization additionally requires it to be strictly positive.
     assets : sequence of hashable, optional
-        Unique input labels. Must agree with the component estimates.
+        Unique, non-missing asset labels. If supplied, they must agree
+        with both component estimates. Otherwise the component labels
+        are used.
 
     Attributes
     ----------
     mean : ndarray of float64, shape (n_assets,)
-        Read-only sample return means.
-    correlation, covariance : ndarray of float64
-        Read-only square estimated matrices.
+        Read-only sample means in original return units.
+    correlation, covariance : ndarray of float64, shape (n_assets, n_assets)
+        Read-only dependence and covariance matrices. The covariance
+        diagonal equals the current sample marginal variances.
+    correlation_estimate : CorrelationEstimate
+        Second-order component, including its scales and pandas export.
     cokurtosis : CokurtosisEstimate
-        Compact fourth central moment, retaining raw return scales.
+        Fourth-order component, with portfolio evaluation and derivatives.
     reference_variance : float
-        Raw equal-weight sample variance, without annualization.
+        Equal-weight sample variance used to normalize optimization.
     assets : tuple of hashable or None
-        Asset labels in output array order.
+        Asset labels in output array order, or None for unlabeled input.
+
+    Raises
+    ------
+    ValueError
+        If the mean or reference variance is invalid, or the component
+        dimensions, scales or labels disagree.
+
+    See Also
+    --------
+    portfolio : Evaluate moments for given weights.
+    optimize : Find a unit-budget allocation for a chosen penalty.
+    frontier : Solve for several penalties with successive warm starts.
 
     Examples
     --------
     >>> import numpy as np
     >>> from hoao import CV
-    >>> returns = np.random.default_rng(1).normal(size=(100, 4)) * 0.01
+    >>> returns = 0.01 * np.random.default_rng(1).standard_t(5, size=(250, 4))
     >>> model = CV(random_state=2).fit(returns)
-    >>> model.portfolio(np.full(4, 0.25)).volatility > 0
+    >>> weights = np.full(4, 0.25)
+    >>> moments = model.portfolio(weights)
+    >>> bool(np.isclose(moments.variance, weights @ model.covariance @ weights))
+    True
+    >>> allocation = model.optimize(gamma=1.0)
+    >>> bool(np.isclose(allocation.weights.sum(), 1.0))
     True
     """
 
@@ -446,31 +642,57 @@ class MomentModel:
         self.cokurtosis, self.reference_variance, self.assets = cokurtosis_estimate, float(reference_variance), asset_labels
 
     def portfolio(self, weights: WeightInput) -> PortfolioMoments:
-        """Compute portfolio mean, variance, volatility and fourth moments.
+        """Evaluate the estimated moments of a portfolio with given weights.
 
         Parameters
         ----------
         weights : array_like or pandas.Series, shape (n_assets,)
-            Finite weights, including short positions. They need not sum
-            to one. Series are aligned by label, never silently by position.
+            Finite real weights. Negative positions are allowed, and weights
+            need not sum to one. Arrays follow the fitting-data column order.
+            A Series is reordered by asset label and must contain exactly
+            the model's labels, without duplicates or missing labels.
 
         Returns
         -------
         PortfolioMoments
-            All moments use the original return frequency and units.
-            Kurtosis is Pearson kurtosis, or NaN for zero variance.
+            Mean, variance, volatility, fourth central moment and Pearson
+            kurtosis in the original units and observation frequency.
+
+        Raises
+        ------
+        TypeError
+            If weights do not have a real numeric dtype.
+        ValueError
+            If weights have an invalid shape, values or labels. A weight
+            Series also requires a model with asset labels.
+        FloatingPointError
+            If the computed variance is negative beyond floating-point
+            roundoff. A negative value within roundoff is set to zero.
 
         Notes
         -----
-        Separately filtered covariance and cokurtosis need not be moments
-        of a single distribution. Kurtosis below one is reported unchanged.
+        The mean is the weighted sample mean. Variance and fourth moment use
+        the fitted dependence estimates. Their ratio is Pearson kurtosis,
+        without subtracting three; it is NaN for zero variance. Separately
+        filtered moments can give kurtosis below one, which is reported
+        unchanged rather than treated as a numerical error.
 
         Examples
         --------
+        A labeled weight vector can be supplied in a different order from
+        the return columns:
+
+        >>> import numpy as np
+        >>> import pandas as pd
         >>> from hoao import Sample
-        >>> risk = Sample().fit([[-1.], [0.], [1.]]).portfolio([1.])
-        >>> round(risk.kurtosis, 6)
-        1.5
+        >>> returns = pd.DataFrame({"A": [0.01, -0.02, 0.03],
+        ...                         "B": [-0.01, 0.01, 0.02]})
+        >>> model = Sample().fit(returns)
+        >>> weights = pd.Series({"B": 0.4, "A": 0.6})
+        >>> moments = model.portfolio(weights)
+        >>> realized = returns @ weights
+        >>> bool(np.isclose(moments.variance, realized.var(ddof=0)))
+        True
         """
         w = weights_array(weights, len(self.mean), self.assets)
         variance = float(w @ self.covariance @ w)
@@ -484,73 +706,125 @@ class MomentModel:
                                 fourth / variance**2 if variance > 0 else float("nan"))
 
     def optimize(self, gamma: float = 0.0, *, tol: float = 1e-8, max_iter: int = 1000) -> OptimizationResult:
-        """Minimize normalized variance plus a fourth-moment penalty.
+        """Minimize variance and fourth moment subject to a unit budget.
 
         Parameters
         ----------
-        gamma : float, default 0.0
-            Nonnegative fourth-moment penalty. Zero gives global minimum
-            variance. The objective is variance / s2 + gamma * m4 / s2**2,
-            where s2 is ``reference_variance``.
-        tol : float, default 1e-8
-            Target infinity norm of the reduced objective gradient.
-        max_iter : int, default 1000
-            Maximum quasi-Newton iterations before final Newton polishing.
+        gamma : float, default=0.0
+            Finite, nonnegative penalty on the normalized fourth central
+            moment. Zero gives the global minimum-variance portfolio. Larger
+            values place more weight on the fourth moment relative to
+            variance; this is not a penalty on kurtosis itself.
+        tol : float, default=1e-8
+            Positive, finite target for the infinity norm of the objective
+            gradient in coordinates that satisfy the budget constraint.
+        max_iter : int, default=1000
+            Maximum BFGS iterations. A subsequent Hessian-vector refinement,
+            when needed, can use up to ``min(max_iter, 100)`` more iterations.
 
         Returns
         -------
         OptimizationResult
-            Unit-budget weights, estimated moments and convergence metrics.
+            Unit-budget weights, fitted portfolio moments, objective value
+            and convergence diagnostics. The weights follow model asset order.
 
         Raises
         ------
         OptimizationError
-            If feasibility or stationarity checks fail. The exception's
-            ``result`` attribute contains the diagnostic candidate.
+            If the candidate fails the budget or gradient-residual checks.
+            The exception's ``result`` contains the candidate and diagnostics.
         ValueError
-            If the penalty is negative or the reference variance is zero.
+            If `gamma`, `tol` or `max_iter` is invalid, or the equal-weight
+            reference variance is not strictly positive.
+
+        See Also
+        --------
+        frontier : Reuse each solution as the starting point for the next penalty.
+        OptimizationResult : Meaning of the returned diagnostics.
 
         Notes
         -----
-        Short sales are allowed. No expected-return target, leverage cap,
-        transaction cost or compatibility correction is imposed.
+        The objective is ``variance / s2 + gamma * fourth_moment / s2**2``,
+        where ``s2 = reference_variance`` is the unfiltered sample variance
+        of equal-weight returns. Using this common scale makes the penalty
+        independent of whether returns are supplied as fractions or percents.
+
+        Weights sum to one and short sales are allowed. No expected-return
+        forecast enters the objective. For ``gamma=0``, a direct constrained
+        covariance solve is used; singular systems use a minimum-norm
+        least-squares solution. For positive penalties, SciPy uses analytic
+        gradients and Hessian-vector products on the CPU.
+
+        Acceptance requires a budget error at most ``1e-10`` and a reduced
+        gradient residual at most ``max(1e-6, 10 * tol)``. These independent
+        checks determine success, including when the solver reports that
+        floating-point precision prevented further improvement.
 
         Examples
         --------
         >>> import numpy as np
         >>> from hoao import Sample
-        >>> model = Sample().fit(np.random.default_rng(2).normal(size=(60, 3)))
-        >>> bool(abs(model.optimize().weights.sum() - 1) < 1e-12)
+        >>> returns = 0.01 * np.random.default_rng(2).standard_t(5, size=(250, 4))
+        >>> model = Sample().fit(returns)
+        >>> allocation = model.optimize(gamma=1.0)
+        >>> bool(np.isclose(allocation.weights.sum(), 1.0))
+        True
+        >>> allocation.success
+        True
+        >>> scale = model.reference_variance
+        >>> expected = (allocation.moments.variance / scale
+        ...             + allocation.moments.fourth_moment / scale**2)
+        >>> bool(np.isclose(allocation.objective, expected))
         True
         """
         from .optimization import optimize
         return optimize(self, gamma, tol=tol, max_iter=max_iter)
 
     def frontier(self, gammas: Sequence[float], *, tol: float = 1e-8, max_iter: int = 1000) -> list[OptimizationResult]:
-        """Optimize a sequence of penalties with successive warm starts.
+        """Solve the variance–fourth-moment allocation for a sequence of penalties.
 
         Parameters
         ----------
         gammas : sequence of float
-            Nonnegative penalties, evaluated in the supplied order.
-        tol : float, default 1e-8
-            Target reduced-gradient infinity norm for each portfolio.
-        max_iter : int, default 1000
-            Maximum iterations per optimization.
+            Finite, nonnegative penalties, evaluated in the supplied order.
+            Each solution initializes the next optimization. An increasing
+            sequence is convenient for tracing the tradeoff from minimum
+            variance toward smaller fourth moments; no sorting is applied.
+        tol : float, default=1e-8
+            Positive, finite target for the reduced objective gradient in
+            each solve. See :meth:`optimize` for the acceptance threshold.
+        max_iter : int, default=1000
+            Maximum BFGS iterations per solve, followed by at most
+            ``min(max_iter, 100)`` refinement iterations when needed.
 
         Returns
         -------
         list of OptimizationResult
-            Results in input order. These are fitted allocations; an
-            out-of-sample frontier requires separate future observations.
+            Allocations in the order of `gammas`. An empty sequence returns
+            an empty list. All portfolio moments are fitted estimates from
+            this model, not measurements on future returns.
+
+        Raises
+        ------
+        OptimizationError
+            If a solve fails its feasibility or stationarity checks. The
+            exception contains that solve's diagnostic result.
+        ValueError
+            If a penalty or solver setting is invalid, or the reference
+            variance is not strictly positive when a solve is attempted.
 
         Examples
         --------
         >>> import numpy as np
         >>> from hoao import Sample
-        >>> model = Sample().fit(np.random.default_rng(2).normal(size=(60, 3)))
-        >>> len(model.frontier([0., 1., 10.]))
-        3
+        >>> returns = np.random.default_rng(2).standard_t(5, size=(250, 4))
+        >>> model = Sample().fit(returns)
+        >>> allocations = model.frontier([0.0, 1.0, 10.0])
+        >>> [item.gamma for item in allocations]
+        [0.0, 1.0, 10.0]
+        >>> weights = np.stack([item.weights for item in allocations])
+        >>> np.allclose(weights.sum(axis=1), 1.0)
+        True
         """
         from .optimization import optimize
         result: list[OptimizationResult] = []

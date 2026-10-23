@@ -1,8 +1,15 @@
-"""Higher-order moment estimation and portfolio allocation.
+"""HOAO: nonlinear shrinkage of covariance and cokurtosis for large portfolios.
 
-Fit sample, cross-validated or historically calibrated moments using
-observation-by-asset arrays. Numerical results use float64 and the original
-return units. See the individual objects for executable examples.
+Sample and CV estimate moments from a current return window. For
+historical estimation, pass a ReturnsPanel to calibrate, then apply the
+resulting Calibration to current returns. Each estimator returns a
+MomentModel for portfolio evaluation and variance–fourth-moment optimization.
+
+Inputs have one row per observation and one column per asset. NumPy arrays
+and pandas DataFrames are accepted; numerical outputs are NumPy float64
+arrays with explicit methods for labeled pandas conversion. Moments use
+population normalization (ddof=0) and the original return units and
+frequency. No annualization is applied.
 """
 from .calibration import Calibration as Calibration, calibrate as calibrate
 from .estimators import CV as CV, Sample as Sample

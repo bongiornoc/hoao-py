@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hoao"
 version = "0.1.0"
-description = "Cross-validated and historical oracle estimators for correlation and cokurtosis"
+description = "Nonlinear shrinkage of covariance and cokurtosis for large portfolios"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "BSD-3-Clause"

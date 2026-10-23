@@ -1,7 +1,7 @@
 cff-version: 1.2.0
-message: "If you use hoao in research, please cite the accompanying manuscript."
+message: "If you use HOAO in research, please cite the accompanying manuscript."
 type: software
-title: "hoao: correlation and cokurtosis estimation"
+title: "HOAO: nonlinear shrinkage of covariance and cokurtosis for large portfolios"
 version: 0.1.0
 license: BSD-3-Clause
 repository-code: "https://github.com/bongiornoc/hoao-py"

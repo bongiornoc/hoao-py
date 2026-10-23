@@ -1,4 +1,9 @@
-"""Point-in-time return panels for historical calibration."""
+"""Return histories and asset universes for historical calibration.
+
+A ReturnsPanel records which assets were available on each observation
+date. Eligibility combines that information with the trailing return
+history, so asset selection does not depend on subsequent returns.
+"""
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping, Sequence
@@ -99,56 +104,101 @@ def _positive_int(value: Any, name: str, *, zero: bool = False) -> int:
 
 
 class ReturnsPanel:
-    """A return table and its point-in-time asset universe.
+    """A return history with an asset universe specified for each date.
+
+    Construct a panel once and pass it to :func:`calibrate` or
+    :meth:`Calibration.update`. The panel stores a copy of the data and
+    caches eligibility calculations for each training-window length.
 
     Parameters
     ----------
-    returns : pandas.DataFrame or array_like of shape (n_observations, n_assets)
-        Simple returns in consistent units, with rows in chronological order.
-        NaN denotes an unobserved return; infinity is rejected. Values are
-        copied to float64, so subsequent changes to the caller's table cannot
-        change this panel. No annualization or imputation is performed here.
+    returns : array_like or pandas.DataFrame, shape (n_observations, n_assets)
+        Real returns with observations in chronological row order and
+        assets in columns. NaN denotes a missing observation; infinity
+        is rejected. Both axes must be nonempty. Values are copied to
+        float64 without annualization or filling missing observations.
     dates : sequence of date-like, optional
-        Strictly increasing, unique dates for array input. A DataFrame's
-        datetime index supplies these automatically. With a RangeIndex or an
-        array without dates, cutoffs refer to integer row positions.
-        Timezone-aware dates are converted to UTC. Dates outside NumPy's
-        nanosecond timestamp range (approximately 1677--2262) are rejected.
+        Unique, strictly increasing dates for array input, one per row.
+        A DataFrame supplies its own index, so this argument must be
+        omitted for DataFrame input. Without dates, row positions are
+        used; a positional DataFrame must have index ``0, 1, ..., T-1``.
+        Timezone-aware timestamps are converted to UTC, and dates must
+        be representable as ``datetime64[ns]``.
     assets : sequence of hashable, optional
-        Unique asset labels for array input; defaults to column positions.
-        DataFrame column labels are preserved.
-    available : array_like, pandas.DataFrame, mapping, or sequence, optional
-        An aligned boolean table, a mapping from dates (or row positions) to
-        lists of asset labels, or one list of asset labels per row. Missing
-        mapping dates have an empty universe. Availability always refers to
-        information known on that row's signal date. If omitted, all assets
-        are candidates. At calibration time candidates must additionally have
-        a complete, finite, nonconstant training history. Target values never
-        determine eligibility. Liquidity and size screens require an explicit
-        universe; they cannot be inferred from returns alone.
+        Unique, non-missing column labels for array input. Defaults to
+        integer column positions. Omit for a DataFrame, whose column
+        labels are preserved.
+    available : ndarray of bool, pandas.DataFrame, mapping, or sequence, optional
+        Asset availability known on each row's signal date. Supply a
+        boolean array of the same shape as `returns`, a boolean DataFrame
+        with exactly matching row and column labels in the same order,
+        a mapping from dates or row positions to lists of asset labels,
+        or one such list per row. Mapping keys must identify panel rows;
+        omitted rows have an empty universe. Duplicate or unknown asset
+        labels are errors. If omitted, all assets are candidates.
 
     Attributes
     ----------
-    values : numpy.ndarray of shape (n_observations, n_assets)
-        Read-only float64 return values.
-    dates : numpy.ndarray of shape (n_observations,) or None
-        Read-only UTC timestamps, or None for a positional panel.
+    values : ndarray of float64, shape (n_observations, n_assets)
+        Read-only return values, including any NaNs in the input.
+    dates : ndarray of datetime64[ns], shape (n_observations,), or None
+        Read-only timestamps, or None for a positional panel.
     assets : tuple of hashable
-        Asset labels in column order.
-    available : numpy.ndarray of shape (n_observations, n_assets)
-        Read-only boolean eligibility flags before training-history checks.
+        Asset labels in return-column order.
+    available : ndarray of bool, shape (n_observations, n_assets)
+        Read-only availability mask before checking training histories.
+        All entries are True when no availability was supplied.
+
+    Raises
+    ------
+    ValueError
+        If returns, dates or labels are invalid, or availability cannot
+        be aligned exactly with the panel.
+
+    See Also
+    --------
+    eligible : Inspect which assets have a usable trailing history.
+    calibrate : Sample historical training and target windows.
+
+    Notes
+    -----
+    On a signal date, an asset is eligible only if it is marked available
+    and has a complete, finite, nonconstant training history ending on
+    that date. A missing observation in the subsequent target window
+    does not exclude it or cause a replacement asset to be selected.
+
+    Returns alone can establish whether the training history is usable;
+    they cannot reconstruct liquidity or capitalization screens. Encode
+    such criteria in `available`, using information known at each date.
 
     Examples
     --------
+    Automatic eligibility excludes an asset while a missing observation
+    remains in its trailing window:
+
     >>> import numpy as np
     >>> from hoao import ReturnsPanel
-    >>> panel = ReturnsPanel(np.arange(30.0).reshape(10, 3))
-    >>> panel.eligible(train_size=4).sum(axis=1).tolist()
-    [0, 0, 0, 3, 3, 3, 3, 3, 3, 3]
-    >>> panel = ReturnsPanel(np.arange(30.0).reshape(10, 3),
-    ...                      available={3: [0, 2], 4: [1, 2]})
-    >>> panel.eligible(train_size=4)[3].tolist()
-    [True, False, True]
+    >>> returns = np.array([[0.01, 0.02, 0.03],
+    ...                     [0.02, 0.01, np.nan],
+    ...                     [-0.01, 0.02, 0.01],
+    ...                     [0.03, -0.01, 0.02],
+    ...                     [0.01, 0.03, 0.04]])
+    >>> panel = ReturnsPanel(returns, assets=["A", "B", "C"])
+    >>> panel.eligible(train_size=3)[2].tolist()
+    [True, True, False]
+    >>> panel.eligible(train_size=3)[4].tolist()
+    [True, True, True]
+
+    An explicit universe restricts these candidates further. In this
+    positional panel, the mapping keys are row numbers:
+
+    >>> available = {2: ["A", "C"], 4: ["B", "C"]}
+    >>> panel = ReturnsPanel(returns, assets=["A", "B", "C"],
+    ...                      available=available)
+    >>> panel.eligible(train_size=3)[2].tolist()
+    [True, False, False]
+    >>> panel.eligible(train_size=3)[4].tolist()
+    [False, True, True]
     """
 
     def __init__(self, returns: ReturnInput, *, dates: DateInput | None = None,
@@ -194,22 +244,22 @@ class ReturnsPanel:
 
     @property
     def values(self) -> FloatArray:
-        """Read-only return array; rows are observations and columns assets."""
+        """Read-only float64 returns, shaped (n_observations, n_assets)."""
         return self._values.view()
 
     @property
     def dates(self) -> NDArray[np.datetime64] | None:
-        """Read-only UTC dates, or None when cutoffs are row positions."""
+        """Read-only datetime64[ns] timestamps, or None for positional data."""
         return None if self._dates is None else self._dates.view()
 
     @property
     def assets(self) -> tuple[Hashable, ...]:
-        """Asset labels in exactly the order of the return columns."""
+        """Asset labels in return-column order."""
         return self._assets
 
     @property
     def available(self) -> NDArray[np.bool_]:
-        """Read-only externally supplied signal-date availability mask."""
+        """Read-only availability flags before checking training histories."""
         return self._available.view()
 
     def __len__(self) -> int:
@@ -288,32 +338,48 @@ class ReturnsPanel:
         return int(cutoff) if self._dates is None else int(np.searchsorted(self._dates, cutoff))
 
     def eligible(self, *, train_size: int) -> NDArray[np.bool_]:
-        """Find eligible assets from information available on each signal row.
+        """Identify available assets with complete, varying training histories.
 
         Parameters
         ----------
         train_size : int
-            Number of consecutive observations ending on the signal row.
+            Positive number of consecutive observations in the training
+            window, including the signal row itself.
 
         Returns
         -------
-        numpy.ndarray of bool, shape (n_observations, n_assets)
-            A new mask. True requires explicit availability, finite returns
-            throughout the training history, and at least two distinct return
-            values in that history. Initial rows without enough history are
-            False. No future values are inspected.
+        ndarray of bool, shape (n_observations, n_assets)
+            True where an asset is available on that row, all returns in its
+            trailing window are finite, and the window contains at least two
+            distinct values. Rows without enough history are False. A
+            one-observation window cannot have positive variance, so
+            ``train_size=1`` returns an all-False mask. The returned array is
+            an independent copy.
+
+        Raises
+        ------
+        ValueError
+            If `train_size` is not a positive integer.
 
         Notes
         -----
-        Finite-history counts and changes between adjacent observations are
-        accumulated once per window length. This avoids repeated rolling
-        variance calculations and cancellation for nearly constant series.
+        Only the training window and availability on the signal row enter
+        this calculation. Future return values and future availability are
+        not inspected. Calibration separately checks whether enough target
+        dates exist before its cutoff.
+
+        Finite-observation counts and adjacent-value changes are accumulated
+        once per window length. This avoids repeatedly computing rolling
+        variances, including cancellation errors for nearly constant data.
 
         Examples
         --------
+        The second asset has a complete history but is constant:
+
+        >>> from hoao import ReturnsPanel
         >>> panel = ReturnsPanel([[0.01, 0.02], [0.03, 0.02], [0.02, 0.02]])
-        >>> panel.eligible(train_size=3)[-1].tolist()
-        [True, False]
+        >>> panel.eligible(train_size=3).tolist()
+        [[False, False], [False, False], [True, False]]
         """
         train_size = _positive_int(train_size, "train_size")
         if train_size not in self._eligibility_cache:

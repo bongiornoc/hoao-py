@@ -1,4 +1,9 @@
-"""Budget-only variance/fourth-moment allocation with analytic derivatives."""
+"""Variance–fourth-moment allocation under a unit-budget constraint.
+
+Use MomentModel.optimize for one penalty or MomentModel.frontier for
+several. Both return weights together with portfolio moments and an
+independent check of feasibility and stationarity.
+"""
 from __future__ import annotations
 
 from collections.abc import Hashable
@@ -18,37 +23,60 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class OptimizationResult:
-    """Portfolio allocation and numerical optimality diagnostics.
+    """Portfolio weights, fitted moments and convergence diagnostics.
+
+    Returned by :meth:`MomentModel.optimize` and :meth:`MomentModel.frontier`.
+    Failed solves attach the same record to :class:`OptimizationError`,
+    allowing the candidate and its diagnostics to be inspected.
 
     Attributes
     ----------
     weights : ndarray of float64, shape (n_assets,)
-        Read-only unit-budget allocation in fitting-data asset order.
+        Read-only allocation in model asset order. Successful allocations
+        sum to one within ``1e-10``; individual weights may be negative.
     moments : PortfolioMoments
-        Estimated moments of this allocation, without annualization.
+        Estimated moments of this allocation in the original return
+        units and frequency, without annualization.
     objective : float
-        Variance / reference_variance + gamma * fourth / reference_variance**2.
+        ``variance / s2 + gamma * fourth_moment / s2**2``, where ``s2``
+        is the model's raw equal-weight sample variance.
     iterations : int
-        Total optimizer iterations. Zero for a direct minimum-variance solve.
+        Total iterations across the initial solve and any refinement.
+        Zero for the direct minimum-variance solve or a single asset.
     gradient_residual : float
-        Infinity norm of the objective gradient in orthonormal budget
-        coordinates. Successful results have residual <= max(1e-6, 10*tol).
+        Infinity norm of the objective gradient in orthonormal
+        coordinates tangent to the budget constraint. A stationary
+        allocation has zero residual. The acceptance threshold is
+        ``max(1e-6, 10 * tol)`` for the requested solver tolerance.
     success : bool
-        Whether independent feasibility and stationarity checks passed.
+        Whether weights and objective are finite and the budget and
+        gradient-residual checks passed. This is checked independently
+        of the underlying SciPy termination flag.
     gamma : float
-        Fourth-moment penalty used for this result.
+        Fourth-moment penalty used in this solve.
     message : str
-        Solver termination information.
+        Solver termination message, including any refinement step.
     assets : tuple of hashable or None
-        Asset labels for conversion to pandas.
+        Asset labels in weight order, or None for unlabeled data.
+
+    Notes
+    -----
+    Convergence describes the optimization of the fitted model. The
+    reported moments are estimates from that model, not subsequent
+    realized portfolio performance.
 
     Examples
     --------
     >>> import numpy as np
     >>> from hoao import Sample
-    >>> model = Sample().fit(np.random.default_rng(4).normal(size=(100, 3)))
-    >>> allocation = model.optimize(gamma=1.)
-    >>> allocation.success
+    >>> returns = 0.01 * np.random.default_rng(4).normal(size=(100, 3))
+    >>> model = Sample().fit(returns)
+    >>> allocation = model.optimize(gamma=1.0)
+    >>> allocation.success, allocation.gradient_residual <= 1e-6
+    (True, True)
+    >>> bool(np.isclose(allocation.weights.sum(), 1.0))
+    True
+    >>> allocation.moments == model.portfolio(allocation.weights)
     True
     """
 
@@ -63,48 +91,73 @@ class OptimizationResult:
     assets: tuple[Hashable, ...] | None
 
     def weights_to_pandas(self) -> pd.Series[float]:
-        """Return a labeled copy of the allocation weights.
+        """Return the allocation as a labeled pandas Series.
 
         Returns
         -------
-        pandas.Series
-            Finite weights in model asset order, named ``weight``. Integer
-            positions are used if the model has no asset labels.
+        pandas.Series of float64, shape (n_assets,)
+            An independent copy named ``'weight'``. The index contains the
+            model's asset labels in fitting-data order, or integer positions
+            if the model was fitted from an unlabeled array.
 
         Raises
         ------
         ImportError
-            If pandas is unavailable; install ``hoao[pandas]``.
+            If pandas is not installed.
 
         Examples
         --------
+        >>> import numpy as np
+        >>> import pandas as pd
         >>> from hoao import Sample
-        >>> result = Sample().fit([[-1.], [0.], [1.]]).optimize()
-        >>> result.weights_to_pandas().tolist()
-        [1.0]
+        >>> returns = pd.DataFrame(
+        ...     np.random.default_rng(4).normal(size=(100, 3)),
+        ...     columns=["A", "B", "C"],
+        ... )
+        >>> allocation = Sample().fit(returns).optimize()
+        >>> weights = allocation.weights_to_pandas()
+        >>> weights.index.tolist(), weights.name
+        (['A', 'B', 'C'], 'weight')
         """
         import pandas as pd
         return pd.Series(self.weights.copy(), index=self.assets, name="weight")
 
 
 class OptimizationError(RuntimeError):
-    """An allocation did not pass feasibility and optimality checks.
+    """An allocation failed the feasibility or stationarity checks.
+
+    Raised by :meth:`MomentModel.optimize` or :meth:`MomentModel.frontier`
+    when the numerical candidate does not meet the acceptance thresholds.
+    The candidate is retained for diagnosis.
 
     Parameters
     ----------
     result : OptimizationResult
-        Diagnostic candidate; its ``success`` field is False.
+        Result of the unsuccessful solve, with ``success=False``.
 
     Attributes
     ----------
     result : OptimizationResult
-        Candidate weights, moments and stationarity residual. The caller
-        can inspect these without treating an unsuccessful solve as valid.
+        Candidate weights, fitted moments, objective, iteration count and
+        gradient residual. Inspect ``result.message`` for the solver's
+        explanation of termination.
 
     Examples
     --------
-    Catch this exception around ``model.optimize`` and inspect
-    ``error.result.gradient_residual`` before changing numerical settings.
+    Catch the exception when a larger workflow needs to record a failure
+    and continue. Here the ordinary solve succeeds; the same code exposes
+    the candidate if a later dataset causes convergence to fail:
+
+    >>> import numpy as np
+    >>> from hoao import OptimizationError, Sample
+    >>> returns = np.random.default_rng(4).normal(size=(100, 3))
+    >>> model = Sample().fit(returns)
+    >>> try:
+    ...     result = model.optimize(gamma=1.0)
+    ... except OptimizationError as error:
+    ...     result = error.result
+    >>> result.success
+    True
     """
 
     result: OptimizationResult
